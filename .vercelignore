@@ -1,4 +1,6 @@
-backend/tests
-backend/venv
+backend/
+api/
+requirements.txt
 *.pyc
 __pycache__
+.env*
