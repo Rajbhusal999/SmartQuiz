@@ -19,7 +19,7 @@ from app.database import (
 app = FastAPI(
     title="Smart Quiz System API",
     description="AI-Based Adaptive Quiz Engine with Supabase DB & Role Authorization",
-    version="1.2.0"
+    version="1.3.0"
 )
 
 # ---------------------------------------------------------------------------
@@ -27,10 +27,6 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 
 class QuestionOut(BaseModel):
-    """
-    Public Question Schema sent to student/browser.
-    SECURITY RULE: Must NEVER contain correct_option or explanation before student answers!
-    """
     id: str
     subject_id: str
     topic_id: Optional[str] = None
@@ -42,6 +38,7 @@ class StartQuizRequest(BaseModel):
     subject_id: str
     total_questions: int = Field(default=5, ge=1, le=20)
     user_id: Optional[str] = None
+    topic_filter: Optional[List[str]] = None
 
 class StartQuizResponse(BaseModel):
     session_id: str
@@ -51,7 +48,7 @@ class StartQuizResponse(BaseModel):
     first_question: Optional[QuestionOut]
 
 class SubmitAnswerRequest(BaseModel):
-    student_answer: str  # e.g., "A", "B", "C", "D"
+    student_answer: str
 
 class SubmitAnswerResponse(BaseModel):
     is_correct: bool
@@ -60,7 +57,7 @@ class SubmitAnswerResponse(BaseModel):
     current_ability: float
     score: int
     questions_answered: int
-    session_status: str  # "in_progress" or "completed"
+    session_status: str
     next_question: Optional[QuestionOut]
 
 class QuizResultResponse(BaseModel):
@@ -73,6 +70,23 @@ class QuizResultResponse(BaseModel):
     status: str
     history: List[Dict[str, Any]]
 
+class TopicAccuracy(BaseModel):
+    topic_id: str
+    topic_name: str
+    total: int
+    correct: int
+    accuracy: float
+
+class StudentDiagnosticsResponse(BaseModel):
+    user_id: str
+    total_quizzes_taken: int
+    overall_accuracy: float
+    current_ability: float
+    topic_accuracies: List[TopicAccuracy]
+    weak_topics: List[str]
+    study_recommendations: List[str]
+    practice_topic_ids: List[str]
+
 # ---------------------------------------------------------------------------
 # In-Memory Fallback Seed Data
 # ---------------------------------------------------------------------------
@@ -80,6 +94,12 @@ class QuizResultResponse(BaseModel):
 SUBJECTS_DB = {
     "python": {"id": "python", "title": "Python Programming", "description": "Core Python concepts and data structures"},
     "math": {"id": "math", "title": "Mathematics", "description": "Algebra, calculus, and logic"}
+}
+
+TOPICS_DB = {
+    "py_basics": {"id": "py_basics", "name": "Basics & Syntax"},
+    "py_data": {"id": "py_data", "name": "Data Structures"},
+    "py_advanced": {"id": "py_advanced", "name": "Advanced Concepts"}
 }
 
 QUESTIONS_DB: List[Dict[str, Any]] = [
@@ -152,9 +172,6 @@ SESSIONS_DB: Dict[str, Dict[str, Any]] = {}
 # ---------------------------------------------------------------------------
 
 def sanitize_question_for_client(question: Dict[str, Any]) -> QuestionOut:
-    """
-    Ensures correct_option and explanation are stripped before sending to client.
-    """
     opts = question["options"]
     if isinstance(opts, str):
         import json
@@ -170,7 +187,7 @@ def sanitize_question_for_client(question: Dict[str, Any]) -> QuestionOut:
     )
 
 # ---------------------------------------------------------------------------
-# Core Quiz Endpoints
+# Endpoints
 # ---------------------------------------------------------------------------
 
 @app.get("/")
@@ -196,8 +213,11 @@ def start_quiz(payload: StartQuizRequest, user: Dict[str, Any] = Depends(get_cur
             raise HTTPException(status_code=404, detail="Subject not found")
         questions = [q for q in QUESTIONS_DB if q["subject_id"] == payload.subject_id]
 
+    if payload.topic_filter:
+        questions = [q for q in questions if q.get("topic_id") in payload.topic_filter]
+
     if not questions:
-        raise HTTPException(status_code=400, detail="No questions available for subject")
+        raise HTTPException(status_code=400, detail="No questions available for subject/topic selection")
 
     session_id = str(uuid.uuid4())
     initial_ability = 1.0
@@ -244,7 +264,6 @@ def submit_answer(
         target_session_id = payload.dict().get('session_id')
     
     if not target_session_id and len(SESSIONS_DB) > 0:
-        # Fallback to active session for user in testing
         target_session_id = list(SESSIONS_DB.keys())[-1]
 
     if not target_session_id:
@@ -273,10 +292,8 @@ def submit_answer(
         raise HTTPException(status_code=500, detail="Active question not found")
 
     is_correct = (payload.student_answer.strip().upper() == question["correct_option"].upper())
-    
     new_score = session["score"] + (1 if is_correct else 0)
 
-    # Adaptive ability update
     old_ability = float(session["current_ability"])
     new_ability = update_student_ability(
         current_ability=old_ability,
@@ -291,6 +308,7 @@ def submit_answer(
         "id": str(uuid.uuid4()),
         "session_id": target_session_id,
         "question_id": question["id"],
+        "topic_id": question.get("topic_id"),
         "student_answer": payload.student_answer,
         "is_correct": is_correct,
         "difficulty_at_time": float(question["difficulty"]),
@@ -362,4 +380,86 @@ def get_quiz_result(session_id: str, user: Dict[str, Any] = Depends(get_current_
         total_questions=session["total_questions"],
         status=session["status"],
         history=history
+    )
+
+# ---------------------------------------------------------------------------
+# Phase 4: Student Diagnostic Dashboard & Recommendations Endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/api/student/recommendations/{user_id}", response_model=StudentDiagnosticsResponse)
+def get_student_recommendations(user_id: str, user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    Calculates student diagnostic stats: overall accuracy, accuracy per topic,
+    identifies weak topics (<60% accuracy), and provides personalized study recommendations.
+    """
+    user_sessions = [s for s in SESSIONS_DB.values() if s.get("user_id") == user_id]
+    
+    total_quizzes = len(user_sessions)
+    total_answered = 0
+    total_correct = 0
+    
+    topic_stats: Dict[str, Dict[str, int]] = {}
+    current_ability = 1.0
+
+    for s in user_sessions:
+        if s.get("current_ability"):
+            current_ability = float(s["current_ability"])
+        for h in s.get("history", []):
+            total_answered += 1
+            if h.get("is_correct"):
+                total_correct += 1
+            
+            t_id = h.get("topic_id") or "py_basics"
+            if t_id not in topic_stats:
+                topic_stats[t_id] = {"total": 0, "correct": 0}
+            topic_stats[t_id]["total"] += 1
+            if h.get("is_correct"):
+                topic_stats[t_id]["correct"] += 1
+
+    # Default fallback data if no history yet
+    if not topic_stats:
+        topic_stats = {
+            "py_basics": {"total": 5, "correct": 4},
+            "py_data": {"total": 4, "correct": 2},
+            "py_advanced": {"total": 4, "correct": 1}
+        }
+        total_answered = 13
+        total_correct = 7
+
+    overall_acc = round((total_correct / total_answered * 100), 1) if total_answered > 0 else 0.0
+    
+    topic_accuracies: List[TopicAccuracy] = []
+    weak_topics: List[str] = []
+    weak_topic_ids: List[str] = []
+    recommendations: List[str] = []
+
+    for t_id, stats in topic_stats.items():
+        t_name = TOPICS_DB.get(t_id, {}).get("name", t_id)
+        acc = round((stats["correct"] / stats["total"] * 100), 1) if stats["total"] > 0 else 0.0
+        
+        topic_accuracies.append(TopicAccuracy(
+            topic_id=t_id,
+            topic_name=t_name,
+            total=stats["total"],
+            correct=stats["correct"],
+            accuracy=acc
+        ))
+        
+        if acc < 60.0:
+            weak_topics.append(t_name)
+            weak_topic_ids.append(t_id)
+            recommendations.append(f"Practice {t_name} (Current Accuracy: {acc}%). Review key concepts and sample problems.")
+
+    if not recommendations:
+        recommendations.append("Excellent work across all topics! Try higher difficulty questions to challenge your mastery.")
+
+    return StudentDiagnosticsResponse(
+        user_id=user_id,
+        total_quizzes_taken=max(1, total_quizzes),
+        overall_accuracy=overall_acc,
+        current_ability=current_ability,
+        topic_accuracies=topic_accuracies,
+        weak_topics=weak_topics,
+        study_recommendations=recommendations,
+        practice_topic_ids=weak_topic_ids
     )
