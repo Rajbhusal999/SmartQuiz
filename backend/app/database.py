@@ -73,3 +73,39 @@ def sb_get_session_history(session_id: str) -> List[Dict[str, Any]]:
         return []
     res = client.table("session_questions").select("*").eq("session_id", session_id).order("order_index").execute()
     return res.data or []
+
+def sb_get_all_questions() -> List[Dict[str, Any]]:
+    client = get_supabase()
+    if not client:
+        return []
+    res = client.table("questions").select("*").execute()
+    return res.data or []
+
+def sb_create_question(question_data: Dict[str, Any]) -> Dict[str, Any]:
+    client = get_supabase()
+    if not client:
+        return question_data
+    res = client.table("questions").insert(question_data).execute()
+    return res.data[0] if res.data else question_data
+
+def sb_update_question(question_id: str, update_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    client = get_supabase()
+    if not client:
+        return None
+    res = client.table("questions").update(update_data).eq("id", question_id).execute()
+    return res.data[0] if res.data else None
+
+def sb_delete_question(question_id: str) -> bool:
+    client = get_supabase()
+    if not client:
+        return False
+    res = client.table("questions").delete().eq("id", question_id).execute()
+    return True
+
+def sb_approve_question(question_id: str) -> bool:
+    client = get_supabase()
+    if not client:
+        return False
+    client.table("questions").update({"reviewed": True}).eq("id", question_id).execute()
+    return True
+

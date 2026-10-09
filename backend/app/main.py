@@ -13,7 +13,12 @@ from app.database import (
     sb_get_session,
     sb_update_session,
     sb_record_session_question,
-    sb_get_session_history
+    sb_get_session_history,
+    sb_get_all_questions,
+    sb_create_question,
+    sb_update_question,
+    sb_delete_question,
+    sb_approve_question
 )
 
 app = FastAPI(
@@ -86,6 +91,40 @@ class StudentDiagnosticsResponse(BaseModel):
     weak_topics: List[str]
     study_recommendations: List[str]
     practice_topic_ids: List[str]
+
+class QuestionCreateRequest(BaseModel):
+    subject_id: str
+    topic_id: str
+    question_text: str
+    options: Dict[str, str]
+    correct_option: str
+    difficulty: float = Field(default=1.0, ge=1.0, le=5.0)
+    explanation: Optional[str] = ""
+    source: str = "manual"
+    reviewed: bool = True
+
+class QuestionUpdateRequest(BaseModel):
+    subject_id: Optional[str] = None
+    topic_id: Optional[str] = None
+    question_text: Optional[str] = None
+    options: Optional[Dict[str, str]] = None
+    correct_option: Optional[str] = None
+    difficulty: Optional[float] = None
+    explanation: Optional[str] = None
+    source: Optional[str] = None
+    reviewed: Optional[bool] = None
+
+class InstructorQuestionResponse(BaseModel):
+    id: str
+    subject_id: str
+    topic_id: Optional[str] = None
+    question_text: str
+    options: Dict[str, str]
+    correct_option: str
+    difficulty: float
+    explanation: Optional[str] = None
+    source: str = "manual"
+    reviewed: bool = True
 
 # ---------------------------------------------------------------------------
 # In-Memory Fallback Seed Data
@@ -463,3 +502,228 @@ def get_student_recommendations(user_id: str, user: Dict[str, Any] = Depends(get
         study_recommendations=recommendations,
         practice_topic_ids=weak_topic_ids
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Instructor Question Bank Endpoints (CRUD, Filters, Review Approval)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/instructor/questions", response_model=List[InstructorQuestionResponse])
+def get_instructor_questions(
+    subject_id: Optional[str] = None,
+    topic_id: Optional[str] = None,
+    difficulty_min: Optional[float] = None,
+    difficulty_max: Optional[float] = None,
+    search: Optional[str] = None,
+    reviewed: Optional[bool] = None,
+    source: Optional[str] = None,
+    user: Dict[str, Any] = Depends(require_roles(["instructor", "admin"]))
+):
+    """
+    List questions with optional filters: subject, topic, difficulty range, keyword search, reviewed status, and source.
+    Requires 'instructor' or 'admin' role.
+    """
+    if is_supabase_enabled():
+        questions = sb_get_all_questions()
+    else:
+        questions = list(QUESTIONS_DB)
+
+    filtered = []
+    for q in questions:
+        # Normalize fields
+        q_subject = q.get("subject_id")
+        q_topic = q.get("topic_id")
+        q_diff = float(q.get("difficulty", 1.0))
+        q_text = q.get("question_text", "").lower()
+        q_reviewed = q.get("reviewed", True)
+        q_source = q.get("source", "manual")
+
+        if subject_id and q_subject != subject_id:
+            continue
+        if topic_id and q_topic != topic_id:
+            continue
+        if difficulty_min is not None and q_diff < difficulty_min:
+            continue
+        if difficulty_max is not None and q_diff > difficulty_max:
+            continue
+        if reviewed is not None and q_reviewed != reviewed:
+            continue
+        if source and q_source != source:
+            continue
+        if search and search.lower() not in q_text:
+            continue
+
+        opts = q.get("options", {})
+        if isinstance(opts, str):
+            import json
+            try:
+                opts = json.loads(opts)
+            except Exception:
+                opts = {}
+
+        filtered.append(InstructorQuestionResponse(
+            id=str(q.get("id")),
+            subject_id=str(q_subject),
+            topic_id=str(q_topic) if q_topic else None,
+            question_text=q.get("question_text", ""),
+            options=opts,
+            correct_option=q.get("correct_option", "A"),
+            difficulty=q_diff,
+            explanation=q.get("explanation"),
+            source=q_source,
+            reviewed=q_reviewed
+        ))
+
+    return filtered
+
+
+@app.post("/api/instructor/questions", response_model=InstructorQuestionResponse, status_code=status.HTTP_201_CREATED)
+def create_instructor_question(
+    q_in: QuestionCreateRequest,
+    user: Dict[str, Any] = Depends(require_roles(["instructor", "admin"]))
+):
+    """
+    Creates a new question in the Question Bank. Requires 'instructor' or 'admin' role.
+    """
+    new_id = f"q_{uuid.uuid4().hex[:8]}"
+    new_question = {
+        "id": new_id,
+        "subject_id": q_in.subject_id,
+        "topic_id": q_in.topic_id,
+        "question_text": q_in.question_text,
+        "options": q_in.options,
+        "correct_option": q_in.correct_option,
+        "difficulty": q_in.difficulty,
+        "explanation": q_in.explanation,
+        "source": q_in.source,
+        "reviewed": q_in.reviewed,
+        "created_by": user.get("id")
+    }
+
+    if is_supabase_enabled():
+        sb_create_question(new_question)
+    else:
+        QUESTIONS_DB.append(new_question)
+
+    return InstructorQuestionResponse(**new_question)
+
+
+@app.put("/api/instructor/questions/{question_id}", response_model=InstructorQuestionResponse)
+def update_instructor_question(
+    question_id: str,
+    q_in: QuestionUpdateRequest,
+    user: Dict[str, Any] = Depends(require_roles(["instructor", "admin"]))
+):
+    """
+    Updates an existing question in the Question Bank. Requires 'instructor' or 'admin' role.
+    """
+    if is_supabase_enabled():
+        all_q = sb_get_all_questions()
+        target = next((q for q in all_q if q.get("id") == question_id), None)
+        if not target:
+            raise HTTPException(status_code=404, detail="Question not found")
+
+        update_data = {k: v for k, v in q_in.model_dump(exclude_unset=True).items() if v is not None}
+        updated = sb_update_question(question_id, update_data)
+        if not updated:
+            raise HTTPException(status_code=500, detail="Failed to update question")
+        return InstructorQuestionResponse(
+            id=str(updated.get("id")),
+            subject_id=str(updated.get("subject_id")),
+            topic_id=updated.get("topic_id"),
+            question_text=updated.get("question_text", ""),
+            options=updated.get("options", {}),
+            correct_option=updated.get("correct_option", "A"),
+            difficulty=float(updated.get("difficulty", 1.0)),
+            explanation=updated.get("explanation"),
+            source=updated.get("source", "manual"),
+            reviewed=updated.get("reviewed", True)
+        )
+    else:
+        target = next((q for q in QUESTIONS_DB if q.get("id") == question_id), None)
+        if not target:
+            raise HTTPException(status_code=404, detail="Question not found")
+
+        update_data = {k: v for k, v in q_in.model_dump(exclude_unset=True).items() if v is not None}
+        target.update(update_data)
+        return InstructorQuestionResponse(
+            id=str(target["id"]),
+            subject_id=str(target["subject_id"]),
+            topic_id=target.get("topic_id"),
+            question_text=target["question_text"],
+            options=target["options"],
+            correct_option=target["correct_option"],
+            difficulty=float(target.get("difficulty", 1.0)),
+            explanation=target.get("explanation"),
+            source=target.get("source", "manual"),
+            reviewed=target.get("reviewed", True)
+        )
+
+
+@app.delete("/api/instructor/questions/{question_id}", status_code=status.HTTP_200_OK)
+def delete_instructor_question(
+    question_id: str,
+    user: Dict[str, Any] = Depends(require_roles(["instructor", "admin"]))
+):
+    """
+    Deletes a question from the Question Bank. Requires 'instructor' or 'admin' role.
+    """
+    if is_supabase_enabled():
+        success = sb_delete_question(question_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Question not found or delete failed")
+    else:
+        global QUESTIONS_DB
+        initial_len = len(QUESTIONS_DB)
+        QUESTIONS_DB = [q for q in QUESTIONS_DB if q.get("id") != question_id]
+        if len(QUESTIONS_DB) == initial_len:
+            raise HTTPException(status_code=404, detail="Question not found")
+
+    return {"message": "Question deleted successfully", "id": question_id}
+
+
+@app.post("/api/instructor/questions/{question_id}/approve", response_model=InstructorQuestionResponse)
+def approve_instructor_question(
+    question_id: str,
+    user: Dict[str, Any] = Depends(require_roles(["instructor", "admin"]))
+):
+    """
+    Quickly approves an unreviewed AI-generated question (sets reviewed=True).
+    Requires 'instructor' or 'admin' role.
+    """
+    if is_supabase_enabled():
+        sb_approve_question(question_id)
+        all_q = sb_get_all_questions()
+        target = next((q for q in all_q if q.get("id") == question_id), None)
+        if not target:
+            raise HTTPException(status_code=404, detail="Question not found")
+        return InstructorQuestionResponse(
+            id=str(target.get("id")),
+            subject_id=str(target.get("subject_id")),
+            topic_id=target.get("topic_id"),
+            question_text=target.get("question_text", ""),
+            options=target.get("options", {}),
+            correct_option=target.get("correct_option", "A"),
+            difficulty=float(target.get("difficulty", 1.0)),
+            explanation=target.get("explanation"),
+            source=target.get("source", "generated"),
+            reviewed=True
+        )
+    else:
+        target = next((q for q in QUESTIONS_DB if q.get("id") == question_id), None)
+        if not target:
+            raise HTTPException(status_code=404, detail="Question not found")
+        target["reviewed"] = True
+        return InstructorQuestionResponse(
+            id=str(target["id"]),
+            subject_id=str(target["subject_id"]),
+            topic_id=target.get("topic_id"),
+            question_text=target["question_text"],
+            options=target["options"],
+            correct_option=target["correct_option"],
+            difficulty=float(target.get("difficulty", 1.0)),
+            explanation=target.get("explanation"),
+            source=target.get("source", "generated"),
+            reviewed=True
+        )
+
