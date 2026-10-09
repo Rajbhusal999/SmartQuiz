@@ -27,8 +27,7 @@ app = FastAPI(
     version="1.3.0"
 )
 
-@app.get("/")
-@app.get("/api")
+@app.get("/api/health")
 def root_health():
     return {"status": "online", "message": "Smart Quiz System API Engine is running"}
 
