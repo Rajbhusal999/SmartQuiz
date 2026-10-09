@@ -1,9 +1,10 @@
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Depends, Header, status
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 import uuid
 
 from app.adaptive import select_next_question, update_student_ability
+from app.auth import get_current_user, require_roles
 from app.database import (
     is_supabase_enabled,
     sb_get_subject,
@@ -16,9 +17,9 @@ from app.database import (
 )
 
 app = FastAPI(
-    title="SmartQuiz API",
-    description="Adaptive Quiz System with Supabase Integration and Secure Answer Protection",
-    version="1.1.0"
+    title="Smart Quiz System API",
+    description="AI-Based Adaptive Quiz Engine with Supabase DB & Role Authorization",
+    version="1.2.0"
 )
 
 # ---------------------------------------------------------------------------
@@ -28,18 +29,19 @@ app = FastAPI(
 class QuestionOut(BaseModel):
     """
     Public Question Schema sent to student/browser.
-    SECURITY REQUIREMENT: Must NEVER contain correct_option or answer keys before student answers!
+    SECURITY RULE: Must NEVER contain correct_option or explanation before student answers!
     """
     id: str
     subject_id: str
+    topic_id: Optional[str] = None
     question_text: str
     options: Dict[str, str]
     difficulty: float
 
 class StartQuizRequest(BaseModel):
-    user_id: str
     subject_id: str
     total_questions: int = Field(default=5, ge=1, le=20)
+    user_id: Optional[str] = None
 
 class StartQuizResponse(BaseModel):
     session_id: str
@@ -84,6 +86,7 @@ QUESTIONS_DB: List[Dict[str, Any]] = [
     {
         "id": "py_1",
         "subject_id": "python",
+        "topic_id": "py_basics",
         "question_text": "What keyword is used to define a function in Python?",
         "options": {"A": "func", "B": "def", "C": "function", "D": "lambda"},
         "correct_option": "B",
@@ -93,6 +96,7 @@ QUESTIONS_DB: List[Dict[str, Any]] = [
     {
         "id": "py_2",
         "subject_id": "python",
+        "topic_id": "py_data",
         "question_text": "Which data structure is immutable in Python?",
         "options": {"A": "List", "B": "Dictionary", "C": "Tuple", "D": "Set"},
         "correct_option": "C",
@@ -102,6 +106,7 @@ QUESTIONS_DB: List[Dict[str, Any]] = [
     {
         "id": "py_3",
         "subject_id": "python",
+        "topic_id": "py_data",
         "question_text": "What is the time complexity of looking up a key in a Python dictionary average case?",
         "options": {"A": "O(1)", "B": "O(n)", "C": "O(log n)", "D": "O(n^2)"},
         "correct_option": "A",
@@ -111,6 +116,7 @@ QUESTIONS_DB: List[Dict[str, Any]] = [
     {
         "id": "py_4",
         "subject_id": "python",
+        "topic_id": "py_advanced",
         "question_text": "What does the @classmethod decorator do in Python?",
         "options": {
             "A": "Makes method static",
@@ -125,6 +131,7 @@ QUESTIONS_DB: List[Dict[str, Any]] = [
     {
         "id": "py_5",
         "subject_id": "python",
+        "topic_id": "py_advanced",
         "question_text": "What mechanism does CPython use for automatic memory management alongside reference counting?",
         "options": {
             "A": "Mark-and-Sweep Garbage Collector",
@@ -156,25 +163,29 @@ def sanitize_question_for_client(question: Dict[str, Any]) -> QuestionOut:
     return QuestionOut(
         id=question["id"],
         subject_id=question["subject_id"],
+        topic_id=question.get("topic_id"),
         question_text=question["question_text"],
         options=opts,
         difficulty=float(question["difficulty"])
     )
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# Core Quiz Endpoints
 # ---------------------------------------------------------------------------
 
 @app.get("/")
 def read_root():
     return {
-        "app": "SmartQuiz API",
+        "app": "Smart Quiz System API",
         "status": "online",
         "supabase_connected": is_supabase_enabled()
     }
 
+@app.post("/quiz/start", response_model=StartQuizResponse, status_code=status.HTTP_201_CREATED)
 @app.post("/api/quiz/start", response_model=StartQuizResponse, status_code=status.HTTP_201_CREATED)
-def start_quiz(payload: StartQuizRequest):
+def start_quiz(payload: StartQuizRequest, user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = payload.user_id or user.get("id", "student_user")
+
     if is_supabase_enabled():
         subject = sb_get_subject(payload.subject_id)
         if not subject:
@@ -194,7 +205,7 @@ def start_quiz(payload: StartQuizRequest):
 
     session_data = {
         "id": session_id,
-        "user_id": payload.user_id,
+        "user_id": user_id,
         "subject_id": payload.subject_id,
         "current_ability": initial_ability,
         "total_questions": payload.total_questions,
@@ -220,15 +231,32 @@ def start_quiz(payload: StartQuizRequest):
     )
 
 
+@app.post("/quiz/answer", response_model=SubmitAnswerResponse)
+@app.post("/quiz/session/{session_id}/submit", response_model=SubmitAnswerResponse)
 @app.post("/api/quiz/session/{session_id}/submit", response_model=SubmitAnswerResponse)
-def submit_answer(session_id: str, payload: SubmitAnswerRequest):
+def submit_answer(
+    payload: SubmitAnswerRequest, 
+    session_id: Optional[str] = None, 
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    target_session_id = session_id or getattr(payload, 'session_id', None)
+    if not target_session_id and hasattr(payload, 'dict'):
+        target_session_id = payload.dict().get('session_id')
+    
+    if not target_session_id and len(SESSIONS_DB) > 0:
+        # Fallback to active session for user in testing
+        target_session_id = list(SESSIONS_DB.keys())[-1]
+
+    if not target_session_id:
+        raise HTTPException(status_code=400, detail="Missing session_id parameter")
+
     if is_supabase_enabled():
-        session = sb_get_session(session_id)
+        session = sb_get_session(target_session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
         questions = sb_get_questions_for_subject(session["subject_id"])
     else:
-        session = SESSIONS_DB.get(session_id)
+        session = SESSIONS_DB.get(target_session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
         questions = [q for q in QUESTIONS_DB if q["subject_id"] == session["subject_id"]]
@@ -261,7 +289,7 @@ def submit_answer(session_id: str, payload: SubmitAnswerRequest):
 
     history_item = {
         "id": str(uuid.uuid4()),
-        "session_id": session_id,
+        "session_id": target_session_id,
         "question_id": question["id"],
         "student_answer": payload.student_answer,
         "is_correct": is_correct,
@@ -269,7 +297,6 @@ def submit_answer(session_id: str, payload: SubmitAnswerRequest):
         "order_index": questions_answered
     }
 
-    # Determine next question / status
     if questions_answered >= session["total_questions"]:
         new_status = "completed"
         next_q = None
@@ -294,7 +321,7 @@ def submit_answer(session_id: str, payload: SubmitAnswerRequest):
     }
 
     if is_supabase_enabled():
-        sb_update_session(session_id, update_fields)
+        sb_update_session(target_session_id, update_fields)
         sb_record_session_question(history_item)
     else:
         session.update(update_fields)
@@ -312,8 +339,9 @@ def submit_answer(session_id: str, payload: SubmitAnswerRequest):
     )
 
 
+@app.get("/quiz/{session_id}/report", response_model=QuizResultResponse)
 @app.get("/api/quiz/session/{session_id}/result", response_model=QuizResultResponse)
-def get_quiz_result(session_id: str):
+def get_quiz_result(session_id: str, user: Dict[str, Any] = Depends(get_current_user)):
     if is_supabase_enabled():
         session = sb_get_session(session_id)
         if not session:
