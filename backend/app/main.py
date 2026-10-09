@@ -190,7 +190,7 @@ def sanitize_question_for_client(question: Dict[str, Any]) -> QuestionOut:
 # Endpoints
 # ---------------------------------------------------------------------------
 
-@app.get("/")
+@app.get("/api")
 def read_root():
     return {
         "app": "Smart Quiz System API",
