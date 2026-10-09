@@ -1,1 +1,0 @@
-# SmartQuiz app package
